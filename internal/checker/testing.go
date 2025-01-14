@@ -8,16 +8,21 @@ import (
 )
 
 // TestCheckRepo runs the checker on repo.
-func TestCheckRepo(t testing.TB, repo restic.Repository) {
+func TestCheckRepo(t testing.TB, repo restic.Repository, skipStructure bool) {
 	chkr := New(repo, true)
 
-	hints, errs := chkr.LoadIndex(context.TODO())
+	hints, errs := chkr.LoadIndex(context.TODO(), nil)
 	if len(errs) != 0 {
 		t.Fatalf("errors loading index: %v", errs)
 	}
 
 	if len(hints) != 0 {
 		t.Fatalf("errors loading index: %v", hints)
+	}
+
+	err := chkr.LoadSnapshots(context.TODO())
+	if err != nil {
+		t.Error(err)
 	}
 
 	// packs
@@ -28,18 +33,23 @@ func TestCheckRepo(t testing.TB, repo restic.Repository) {
 		t.Error(err)
 	}
 
-	// structure
-	errChan = make(chan error)
-	go chkr.Structure(context.TODO(), nil, errChan)
+	if !skipStructure {
+		// structure
+		errChan = make(chan error)
+		go chkr.Structure(context.TODO(), nil, errChan)
 
-	for err := range errChan {
-		t.Error(err)
-	}
+		for err := range errChan {
+			t.Error(err)
+		}
 
-	// unused blobs
-	blobs := chkr.UnusedBlobs(context.TODO())
-	if len(blobs) > 0 {
-		t.Errorf("unused blobs found: %v", blobs)
+		// unused blobs
+		blobs, err := chkr.UnusedBlobs(context.TODO())
+		if err != nil {
+			t.Error(err)
+		}
+		if len(blobs) > 0 {
+			t.Errorf("unused blobs found: %v", blobs)
+		}
 	}
 
 	// read data

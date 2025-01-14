@@ -1,8 +1,13 @@
 package restic
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
+	"path"
 	"sort"
+	"strings"
 
 	"github.com/restic/restic/internal/errors"
 
@@ -91,10 +96,122 @@ func (t *Tree) Sort() {
 // Subtrees returns a slice of all subtree IDs of the tree.
 func (t *Tree) Subtrees() (trees IDs) {
 	for _, node := range t.Nodes {
-		if node.Type == "dir" && node.Subtree != nil {
+		if node.Type == NodeTypeDir && node.Subtree != nil {
 			trees = append(trees, *node.Subtree)
 		}
 	}
 
 	return trees
+}
+
+type BlobLoader interface {
+	LoadBlob(context.Context, BlobType, ID, []byte) ([]byte, error)
+}
+
+// LoadTree loads a tree from the repository.
+func LoadTree(ctx context.Context, r BlobLoader, id ID) (*Tree, error) {
+	debug.Log("load tree %v", id)
+
+	buf, err := r.LoadBlob(ctx, TreeBlob, id, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	t := &Tree{}
+	err = json.Unmarshal(buf, t)
+	if err != nil {
+		return nil, err
+	}
+
+	return t, nil
+}
+
+type BlobSaver interface {
+	SaveBlob(context.Context, BlobType, []byte, ID, bool) (ID, bool, int, error)
+}
+
+// SaveTree stores a tree into the repository and returns the ID. The ID is
+// checked against the index. The tree is only stored when the index does not
+// contain the ID.
+func SaveTree(ctx context.Context, r BlobSaver, t *Tree) (ID, error) {
+	buf, err := json.Marshal(t)
+	if err != nil {
+		return ID{}, errors.Wrap(err, "MarshalJSON")
+	}
+
+	// append a newline so that the data is always consistent (json.Encoder
+	// adds a newline after each object)
+	buf = append(buf, '\n')
+
+	id, _, _, err := r.SaveBlob(ctx, TreeBlob, buf, ID{}, false)
+	return id, err
+}
+
+var ErrTreeNotOrdered = errors.New("nodes are not ordered or duplicate")
+
+type TreeJSONBuilder struct {
+	buf      bytes.Buffer
+	lastName string
+}
+
+func NewTreeJSONBuilder() *TreeJSONBuilder {
+	tb := &TreeJSONBuilder{}
+	_, _ = tb.buf.WriteString(`{"nodes":[`)
+	return tb
+}
+
+func (builder *TreeJSONBuilder) AddNode(node *Node) error {
+	if node.Name <= builder.lastName {
+		return fmt.Errorf("node %q, last %q: %w", node.Name, builder.lastName, ErrTreeNotOrdered)
+	}
+	if builder.lastName != "" {
+		_ = builder.buf.WriteByte(',')
+	}
+	builder.lastName = node.Name
+
+	val, err := json.Marshal(node)
+	if err != nil {
+		return err
+	}
+	_, _ = builder.buf.Write(val)
+	return nil
+}
+
+func (builder *TreeJSONBuilder) Finalize() ([]byte, error) {
+	// append a newline so that the data is always consistent (json.Encoder
+	// adds a newline after each object)
+	_, _ = builder.buf.WriteString("]}\n")
+	buf := builder.buf.Bytes()
+	// drop reference to buffer
+	builder.buf = bytes.Buffer{}
+	return buf, nil
+}
+
+func FindTreeDirectory(ctx context.Context, repo BlobLoader, id *ID, dir string) (*ID, error) {
+	if id == nil {
+		return nil, errors.New("tree id is null")
+	}
+
+	dirs := strings.Split(path.Clean(dir), "/")
+	subfolder := ""
+
+	for _, name := range dirs {
+		if name == "" || name == "." {
+			continue
+		}
+		subfolder = path.Join(subfolder, name)
+		tree, err := LoadTree(ctx, repo, *id)
+		if err != nil {
+			return nil, fmt.Errorf("path %s: %w", subfolder, err)
+		}
+		node := tree.Find(name)
+		if node == nil {
+			return nil, fmt.Errorf("path %s: not found", subfolder)
+		}
+		if node.Type != NodeTypeDir || node.Subtree == nil {
+			return nil, fmt.Errorf("path %s: not a directory", subfolder)
+		}
+		id = node.Subtree
+	}
+	return id, nil
 }

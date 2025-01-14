@@ -2,11 +2,11 @@ package archiver
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -25,9 +25,13 @@ func TestSnapshot(t testing.TB, repo restic.Repository, path string, parent *res
 		Tags:     []string{"test"},
 	}
 	if parent != nil {
-		opts.ParentSnapshot = *parent
+		sn, err := restic.LoadSnapshot(context.TODO(), repo, *parent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts.ParentSnapshot = sn
 	}
-	sn, _, err := arch.Snapshot(context.TODO(), []string{path}, opts)
+	sn, _, _, err := arch.Snapshot(context.TODO(), []string{path}, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,30 +63,49 @@ func (s TestSymlink) String() string {
 	return "<Symlink>"
 }
 
+// TestHardlink describes a hardlink created for a test.
+type TestHardlink struct {
+	Target string
+}
+
+func (s TestHardlink) String() string {
+	return "<Hardlink>"
+}
+
 // TestCreateFiles creates a directory structure described by dir at target,
 // which must already exist. On Windows, symlinks aren't created.
 func TestCreateFiles(t testing.TB, target string, dir TestDir) {
 	t.Helper()
-	for name, item := range dir {
+
+	// ensure a stable order such that it can be guaranteed that a hardlink target already exists
+	var names []string
+	for name := range dir {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		item := dir[name]
 		targetPath := filepath.Join(target, name)
 
 		switch it := item.(type) {
 		case TestFile:
-			err := ioutil.WriteFile(targetPath, []byte(it.Content), 0644)
+			err := os.WriteFile(targetPath, []byte(it.Content), 0644)
 			if err != nil {
 				t.Fatal(err)
 			}
 		case TestSymlink:
-			if runtime.GOOS == "windows" {
-				continue
+			err := os.Symlink(filepath.FromSlash(it.Target), targetPath)
+			if err != nil {
+				t.Fatal(err)
 			}
-
-			err := fs.Symlink(filepath.FromSlash(it.Target), targetPath)
+		case TestHardlink:
+			err := os.Link(filepath.Join(target, filepath.FromSlash(it.Target)), targetPath)
 			if err != nil {
 				t.Fatal(err)
 			}
 		case TestDir:
-			err := fs.Mkdir(targetPath, 0755)
+			err := os.Mkdir(targetPath, 0755)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -134,17 +157,7 @@ func TestEnsureFiles(t testing.TB, target string, dir TestDir) {
 
 	// first, test that all items are there
 	TestWalkFiles(t, target, dir, func(path string, item interface{}) error {
-		// ignore symlinks on Windows
-		if _, ok := item.(TestSymlink); ok && runtime.GOOS == "windows" {
-			// mark paths and parents as checked
-			pathsChecked[path] = struct{}{}
-			for parent := filepath.Dir(path); parent != target; parent = filepath.Dir(parent) {
-				pathsChecked[parent] = struct{}{}
-			}
-			return nil
-		}
-
-		fi, err := fs.Lstat(path)
+		fi, err := os.Lstat(path)
 		if err != nil {
 			return err
 		}
@@ -156,12 +169,12 @@ func TestEnsureFiles(t testing.TB, target string, dir TestDir) {
 			}
 			return nil
 		case TestFile:
-			if !fs.IsRegularFile(fi) {
+			if !fi.Mode().IsRegular() {
 				t.Errorf("is not a regular file: %v", path)
 				return nil
 			}
 
-			content, err := ioutil.ReadFile(path)
+			content, err := os.ReadFile(path)
 			if err != nil {
 				return err
 			}
@@ -175,7 +188,7 @@ func TestEnsureFiles(t testing.TB, target string, dir TestDir) {
 				return nil
 			}
 
-			target, err := fs.Readlink(path)
+			target, err := os.Readlink(path)
 			if err != nil {
 				return err
 			}
@@ -195,7 +208,7 @@ func TestEnsureFiles(t testing.TB, target string, dir TestDir) {
 	})
 
 	// then, traverse the directory again, looking for additional files
-	err := fs.Walk(target, func(path string, fi os.FileInfo, err error) error {
+	err := filepath.Walk(target, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -219,13 +232,13 @@ func TestEnsureFiles(t testing.TB, target string, dir TestDir) {
 }
 
 // TestEnsureFileContent checks if the file in the repo is the same as file.
-func TestEnsureFileContent(ctx context.Context, t testing.TB, repo restic.Repository, filename string, node *restic.Node, file TestFile) {
+func TestEnsureFileContent(ctx context.Context, t testing.TB, repo restic.BlobLoader, filename string, node *restic.Node, file TestFile) {
 	if int(node.Size) != len(file.Content) {
 		t.Fatalf("%v: wrong node size: want %d, got %d", filename, node.Size, len(file.Content))
 		return
 	}
 
-	content := make([]byte, restic.CiphertextLength(len(file.Content)))
+	content := make([]byte, len(file.Content))
 	pos := 0
 	for _, id := range node.Content {
 		part, err := repo.LoadBlob(ctx, restic.DataBlob, id, content[pos:])
@@ -234,6 +247,7 @@ func TestEnsureFileContent(ctx context.Context, t testing.TB, repo restic.Reposi
 			return
 		}
 
+		copy(content[pos:pos+len(part)], part)
 		pos += len(part)
 	}
 
@@ -246,10 +260,10 @@ func TestEnsureFileContent(ctx context.Context, t testing.TB, repo restic.Reposi
 
 // TestEnsureTree checks that the tree ID in the repo matches dir. On Windows,
 // Symlinks are ignored.
-func TestEnsureTree(ctx context.Context, t testing.TB, prefix string, repo restic.Repository, treeID restic.ID, dir TestDir) {
+func TestEnsureTree(ctx context.Context, t testing.TB, prefix string, repo restic.BlobLoader, treeID restic.ID, dir TestDir) {
 	t.Helper()
 
-	tree, err := repo.LoadTree(ctx, treeID)
+	tree, err := restic.LoadTree(ctx, repo, treeID)
 	if err != nil {
 		t.Fatal(err)
 		return
@@ -275,7 +289,7 @@ func TestEnsureTree(ctx context.Context, t testing.TB, prefix string, repo resti
 
 		switch e := entry.(type) {
 		case TestDir:
-			if node.Type != "dir" {
+			if node.Type != restic.NodeTypeDir {
 				t.Errorf("tree node %v has wrong type %q, want %q", nodePrefix, node.Type, "dir")
 				return
 			}
@@ -287,17 +301,13 @@ func TestEnsureTree(ctx context.Context, t testing.TB, prefix string, repo resti
 
 			TestEnsureTree(ctx, t, path.Join(prefix, node.Name), repo, *node.Subtree, e)
 		case TestFile:
-			if node.Type != "file" {
+			if node.Type != restic.NodeTypeFile {
 				t.Errorf("tree node %v has wrong type %q, want %q", nodePrefix, node.Type, "file")
 			}
 			TestEnsureFileContent(ctx, t, repo, nodePrefix, node, e)
 		case TestSymlink:
-			// skip symlinks on windows
-			if runtime.GOOS == "windows" {
-				continue
-			}
-			if node.Type != "symlink" {
-				t.Errorf("tree node %v has wrong type %q, want %q", nodePrefix, node.Type, "file")
+			if node.Type != restic.NodeTypeSymlink {
+				t.Errorf("tree node %v has wrong type %q, want %q", nodePrefix, node.Type, "symlink")
 			}
 
 			if e.Target != node.LinkTarget {
@@ -307,12 +317,6 @@ func TestEnsureTree(ctx context.Context, t testing.TB, prefix string, repo resti
 	}
 
 	for name := range dir {
-		// skip checking symlinks on Windows
-		entry := dir[name]
-		if _, ok := entry.(TestSymlink); ok && runtime.GOOS == "windows" {
-			continue
-		}
-
 		_, ok := checked[name]
 		if !ok {
 			t.Errorf("tree %v: expected node %q not found, has: %v", prefix, name, nodeNames)

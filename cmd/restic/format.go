@@ -3,60 +3,12 @@ package main
 import (
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/ui"
 )
 
-func formatBytes(c uint64) string {
-	b := float64(c)
-
-	switch {
-	case c > 1<<40:
-		return fmt.Sprintf("%.3f TiB", b/(1<<40))
-	case c > 1<<30:
-		return fmt.Sprintf("%.3f GiB", b/(1<<30))
-	case c > 1<<20:
-		return fmt.Sprintf("%.3f MiB", b/(1<<20))
-	case c > 1<<10:
-		return fmt.Sprintf("%.3f KiB", b/(1<<10))
-	default:
-		return fmt.Sprintf("%d B", c)
-	}
-}
-
-func formatSeconds(sec uint64) string {
-	hours := sec / 3600
-	sec -= hours * 3600
-	min := sec / 60
-	sec -= min * 60
-	if hours > 0 {
-		return fmt.Sprintf("%d:%02d:%02d", hours, min, sec)
-	}
-
-	return fmt.Sprintf("%d:%02d", min, sec)
-}
-
-func formatPercent(numerator uint64, denominator uint64) string {
-	if denominator == 0 {
-		return ""
-	}
-
-	percent := 100.0 * float64(numerator) / float64(denominator)
-
-	if percent > 100 {
-		percent = 100
-	}
-
-	return fmt.Sprintf("%3.2f%%", percent)
-}
-
-func formatDuration(d time.Duration) string {
-	sec := uint64(d / time.Second)
-	return formatSeconds(sec)
-}
-
-func formatNode(path string, n *restic.Node, long bool) string {
+func formatNode(path string, n *restic.Node, long bool, human bool) string {
 	if !long {
 		return path
 	}
@@ -64,26 +16,33 @@ func formatNode(path string, n *restic.Node, long bool) string {
 	var mode os.FileMode
 	var target string
 
+	var size string
+	if human {
+		size = ui.FormatBytes(n.Size)
+	} else {
+		size = fmt.Sprintf("%6d", n.Size)
+	}
+
 	switch n.Type {
-	case "file":
+	case restic.NodeTypeFile:
 		mode = 0
-	case "dir":
+	case restic.NodeTypeDir:
 		mode = os.ModeDir
-	case "symlink":
+	case restic.NodeTypeSymlink:
 		mode = os.ModeSymlink
 		target = fmt.Sprintf(" -> %v", n.LinkTarget)
-	case "dev":
+	case restic.NodeTypeDev:
 		mode = os.ModeDevice
-	case "chardev":
+	case restic.NodeTypeCharDev:
 		mode = os.ModeDevice | os.ModeCharDevice
-	case "fifo":
+	case restic.NodeTypeFifo:
 		mode = os.ModeNamedPipe
-	case "socket":
+	case restic.NodeTypeSocket:
 		mode = os.ModeSocket
 	}
 
-	return fmt.Sprintf("%s %5d %5d %6d %s %s%s",
-		mode|n.Mode, n.UID, n.GID, n.Size,
+	return fmt.Sprintf("%s %5d %5d %s %s %s%s",
+		mode|n.Mode, n.UID, n.GID, size,
 		n.ModTime.Local().Format(TimeFormat), path,
 		target)
 }

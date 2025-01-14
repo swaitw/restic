@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/restic/restic/internal/ui"
 	"github.com/restic/restic/internal/ui/progress"
 	"github.com/restic/restic/internal/ui/termstatus"
 )
@@ -28,37 +29,56 @@ func calculateProgressInterval(show bool, json bool) time.Duration {
 	return interval
 }
 
-// newProgressMax returns a progress.Counter that prints to stdout.
-func newProgressMax(show bool, max uint64, description string) *progress.Counter {
+// newGenericProgressMax returns a progress.Counter that prints to stdout or terminal if provided.
+func newGenericProgressMax(show bool, max uint64, description string, print func(status string, final bool)) *progress.Counter {
 	if !show {
 		return nil
 	}
 	interval := calculateProgressInterval(show, false)
-	canUpdateStatus := stdoutCanUpdateStatus()
 
-	return progress.New(interval, max, func(v uint64, max uint64, d time.Duration, final bool) {
+	return progress.NewCounter(interval, max, func(v uint64, max uint64, d time.Duration, final bool) {
 		var status string
 		if max == 0 {
-			status = fmt.Sprintf("[%s]          %d %s", formatDuration(d), v, description)
+			status = fmt.Sprintf("[%s]          %d %s",
+				ui.FormatDuration(d), v, description)
 		} else {
 			status = fmt.Sprintf("[%s] %s  %d / %d %s",
-				formatDuration(d), formatPercent(v, max), v, max, description)
+				ui.FormatDuration(d), ui.FormatPercent(v, max), v, max, description)
 		}
 
-		printProgress(status, canUpdateStatus)
+		print(status, final)
+	})
+}
+
+func newTerminalProgressMax(show bool, max uint64, description string, term *termstatus.Terminal) *progress.Counter {
+	return newGenericProgressMax(show, max, description, func(status string, final bool) {
 		if final {
-			fmt.Print("\n")
+			term.SetStatus(nil)
+			term.Print(status)
+		} else {
+			term.SetStatus([]string{status})
 		}
 	})
 }
 
-func printProgress(status string, canUpdateStatus bool) {
+// newProgressMax calls newTerminalProgress without a terminal (print to stdout)
+func newProgressMax(show bool, max uint64, description string) *progress.Counter {
+	return newGenericProgressMax(show, max, description, printProgress)
+}
+
+func printProgress(status string, final bool) {
+
+	canUpdateStatus := stdoutCanUpdateStatus()
+
 	w := stdoutTerminalWidth()
 	if w > 0 {
 		if w < 3 {
 			status = termstatus.Truncate(status, w)
 		} else {
-			status = termstatus.Truncate(status, w-3) + "..."
+			trunc := termstatus.Truncate(status, w-3)
+			if len(trunc) < len(status) {
+				status = trunc + "..."
+			}
 		}
 	}
 
@@ -77,4 +97,33 @@ func printProgress(status string, canUpdateStatus bool) {
 	}
 
 	_, _ = os.Stdout.Write([]byte(clear + status + carriageControl))
+	if final {
+		_, _ = os.Stdout.Write([]byte("\n"))
+	}
+}
+
+func newIndexProgress(quiet bool, json bool) *progress.Counter {
+	return newProgressMax(!quiet && !json && stdoutIsTerminal(), 0, "index files loaded")
+}
+
+func newIndexTerminalProgress(quiet bool, json bool, term *termstatus.Terminal) *progress.Counter {
+	return newTerminalProgressMax(!quiet && !json && stdoutIsTerminal(), 0, "index files loaded", term)
+}
+
+type terminalProgressPrinter struct {
+	term *termstatus.Terminal
+	ui.Message
+	show bool
+}
+
+func (t *terminalProgressPrinter) NewCounter(description string) *progress.Counter {
+	return newTerminalProgressMax(t.show, 0, description, t.term)
+}
+
+func newTerminalProgressPrinter(verbosity uint, term *termstatus.Terminal) progress.Printer {
+	return &terminalProgressPrinter{
+		term:    term,
+		Message: *ui.NewMessage(term, verbosity),
+		show:    verbosity > 0,
+	}
 }

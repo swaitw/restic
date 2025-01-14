@@ -1,19 +1,17 @@
 package fs
 
 import (
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 
-	restictest "github.com/restic/restic/internal/test"
+	rtest "github.com/restic/restic/internal/test"
 )
 
 func TestExtendedStat(t *testing.T) {
-	tempdir, cleanup := restictest.TempDir(t)
-	defer cleanup()
-
+	tempdir := rtest.TempDir(t)
 	filename := filepath.Join(tempdir, "file")
-	err := ioutil.WriteFile(filename, []byte("foobar"), 0640)
+	err := os.WriteFile(filename, []byte("foobar"), 0640)
 	if err != nil {
 		t.Fatal(err)
 	}

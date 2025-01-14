@@ -1,8 +1,9 @@
-// xbuild selfupdate
+//go:build selfupdate
 
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 
@@ -23,11 +24,15 @@ files.
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 `,
 	DisableAutoGenTag: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runSelfUpdate(selfUpdateOptions, globalOptions, args)
+		return runSelfUpdate(cmd.Context(), selfUpdateOptions, globalOptions, args)
 	},
 }
 
@@ -45,7 +50,7 @@ func init() {
 	flags.StringVar(&selfUpdateOptions.Output, "output", "", "Save the downloaded file as `filename` (default: running binary itself)")
 }
 
-func runSelfUpdate(opts SelfUpdateOptions, gopts GlobalOptions, args []string) error {
+func runSelfUpdate(ctx context.Context, opts SelfUpdateOptions, gopts GlobalOptions, args []string) error {
 	if opts.Output == "" {
 		file, err := os.Executable()
 		if err != nil {
@@ -73,7 +78,7 @@ func runSelfUpdate(opts SelfUpdateOptions, gopts GlobalOptions, args []string) e
 
 	Verbosef("writing restic to %v\n", opts.Output)
 
-	v, err := selfupdate.DownloadLatestStableRelease(gopts.ctx, opts.Output, version, Verbosef)
+	v, err := selfupdate.DownloadLatestStableRelease(ctx, opts.Output, version, Verbosef)
 	if err != nil {
 		return errors.Fatalf("unable to update restic: %v", err)
 	}

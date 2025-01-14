@@ -2,7 +2,6 @@ package backup
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"time"
 
@@ -15,20 +14,20 @@ import (
 // TextProgress reports progress for the `backup` command.
 type TextProgress struct {
 	*ui.Message
-	*ui.StdioWrapper
 
-	term *termstatus.Terminal
+	term      ui.Terminal
+	verbosity uint
 }
 
 // assert that Backup implements the ProgressPrinter interface
 var _ ProgressPrinter = &TextProgress{}
 
 // NewTextProgress returns a new backup progress reporter.
-func NewTextProgress(term *termstatus.Terminal, verbosity uint) *TextProgress {
+func NewTextProgress(term ui.Terminal, verbosity uint) *TextProgress {
 	return &TextProgress{
-		Message:      ui.NewMessage(term, verbosity),
-		StdioWrapper: ui.NewStdioWrapper(term),
-		term:         term,
+		Message:   ui.NewMessage(term, verbosity),
+		term:      term,
+		verbosity: verbosity,
 	}
 }
 
@@ -38,26 +37,26 @@ func (b *TextProgress) Update(total, processed Counter, errors uint, currentFile
 	if total.Files == 0 && total.Dirs == 0 {
 		// no total count available yet
 		status = fmt.Sprintf("[%s] %v files, %s, %d errors",
-			formatDuration(time.Since(start)),
-			processed.Files, formatBytes(processed.Bytes), errors,
+			ui.FormatDuration(time.Since(start)),
+			processed.Files, ui.FormatBytes(processed.Bytes), errors,
 		)
 	} else {
 		var eta, percent string
 
 		if secs > 0 && processed.Bytes < total.Bytes {
-			eta = fmt.Sprintf(" ETA %s", formatSeconds(secs))
-			percent = formatPercent(processed.Bytes, total.Bytes)
+			eta = fmt.Sprintf(" ETA %s", ui.FormatSeconds(secs))
+			percent = ui.FormatPercent(processed.Bytes, total.Bytes)
 			percent += "  "
 		}
 
 		// include totals
 		status = fmt.Sprintf("[%s] %s%v files %s, total %v files %v, %d errors%s",
-			formatDuration(time.Since(start)),
+			ui.FormatDuration(time.Since(start)),
 			percent,
 			processed.Files,
-			formatBytes(processed.Bytes),
+			ui.FormatBytes(processed.Bytes),
 			total.Files,
-			formatBytes(total.Bytes),
+			ui.FormatBytes(total.Bytes),
 			errors,
 			eta,
 		)
@@ -75,100 +74,63 @@ func (b *TextProgress) Update(total, processed Counter, errors uint, currentFile
 
 // ScannerError is the error callback function for the scanner, it prints the
 // error in verbose mode and returns nil.
-func (b *TextProgress) ScannerError(item string, fi os.FileInfo, err error) error {
-	b.V("scan: %v\n", err)
+func (b *TextProgress) ScannerError(_ string, err error) error {
+	if b.verbosity >= 2 {
+		b.E("scan: %v\n", err)
+	}
 	return nil
 }
 
 // Error is the error callback function for the archiver, it prints the error and returns nil.
-func (b *TextProgress) Error(item string, fi os.FileInfo, err error) error {
+func (b *TextProgress) Error(_ string, err error) error {
 	b.E("error: %v\n", err)
 	return nil
 }
 
-func formatPercent(numerator uint64, denominator uint64) string {
-	if denominator == 0 {
-		return ""
-	}
-
-	percent := 100.0 * float64(numerator) / float64(denominator)
-
-	if percent > 100 {
-		percent = 100
-	}
-
-	return fmt.Sprintf("%3.2f%%", percent)
-}
-
-func formatSeconds(sec uint64) string {
-	hours := sec / 3600
-	sec -= hours * 3600
-	min := sec / 60
-	sec -= min * 60
-	if hours > 0 {
-		return fmt.Sprintf("%d:%02d:%02d", hours, min, sec)
-	}
-
-	return fmt.Sprintf("%d:%02d", min, sec)
-}
-
-func formatDuration(d time.Duration) string {
-	sec := uint64(d / time.Second)
-	return formatSeconds(sec)
-}
-
-func formatBytes(c uint64) string {
-	b := float64(c)
-	switch {
-	case c > 1<<40:
-		return fmt.Sprintf("%.3f TiB", b/(1<<40))
-	case c > 1<<30:
-		return fmt.Sprintf("%.3f GiB", b/(1<<30))
-	case c > 1<<20:
-		return fmt.Sprintf("%.3f MiB", b/(1<<20))
-	case c > 1<<10:
-		return fmt.Sprintf("%.3f KiB", b/(1<<10))
-	default:
-		return fmt.Sprintf("%d B", c)
-	}
-}
-
 // CompleteItem is the status callback function for the archiver when a
 // file/dir has been saved successfully.
-func (b *TextProgress) CompleteItem(messageType, item string, previous, current *restic.Node, s archiver.ItemStats, d time.Duration) {
+func (b *TextProgress) CompleteItem(messageType, item string, s archiver.ItemStats, d time.Duration) {
+	item = termstatus.Quote(item)
+
 	switch messageType {
 	case "dir new":
-		b.VV("new       %v, saved in %.3fs (%v added, %v metadata)", item, d.Seconds(), formatBytes(s.DataSize), formatBytes(s.TreeSize))
+		b.VV("new       %v, saved in %.3fs (%v added, %v stored, %v metadata)",
+			item, d.Seconds(), ui.FormatBytes(s.DataSize),
+			ui.FormatBytes(s.DataSizeInRepo), ui.FormatBytes(s.TreeSizeInRepo))
 	case "dir unchanged":
 		b.VV("unchanged %v", item)
 	case "dir modified":
-		b.VV("modified  %v, saved in %.3fs (%v added, %v metadata)", item, d.Seconds(), formatBytes(s.DataSize), formatBytes(s.TreeSize))
+		b.VV("modified  %v, saved in %.3fs (%v added, %v stored, %v metadata)",
+			item, d.Seconds(), ui.FormatBytes(s.DataSize),
+			ui.FormatBytes(s.DataSizeInRepo), ui.FormatBytes(s.TreeSizeInRepo))
 	case "file new":
-		b.VV("new       %v, saved in %.3fs (%v added)", item, d.Seconds(), formatBytes(s.DataSize))
+		b.VV("new       %v, saved in %.3fs (%v added)", item,
+			d.Seconds(), ui.FormatBytes(s.DataSize))
 	case "file unchanged":
 		b.VV("unchanged %v", item)
 	case "file modified":
-		b.VV("modified  %v, saved in %.3fs (%v added)", item, d.Seconds(), formatBytes(s.DataSize))
+		b.VV("modified  %v, saved in %.3fs (%v added, %v stored)", item,
+			d.Seconds(), ui.FormatBytes(s.DataSize), ui.FormatBytes(s.DataSizeInRepo))
 	}
 }
 
 // ReportTotal sets the total stats up to now
-func (b *TextProgress) ReportTotal(item string, start time.Time, s archiver.ScanStats) {
+func (b *TextProgress) ReportTotal(start time.Time, s archiver.ScanStats) {
 	b.V("scan finished in %.3fs: %v files, %s",
 		time.Since(start).Seconds(),
-		s.Files, formatBytes(s.Bytes),
+		s.Files, ui.FormatBytes(s.Bytes),
 	)
 }
 
 // Reset status
 func (b *TextProgress) Reset() {
 	if b.term.CanUpdateStatus() {
-		b.term.SetStatus([]string{""})
+		b.term.SetStatus(nil)
 	}
 }
 
 // Finish prints the finishing messages.
-func (b *TextProgress) Finish(snapshotID restic.ID, start time.Time, summary *Summary, dryRun bool) {
+func (b *TextProgress) Finish(id restic.ID, summary *archiver.Summary, dryRun bool) {
 	b.P("\n")
 	b.P("Files:       %5d new, %5d changed, %5d unmodified\n", summary.Files.New, summary.Files.Changed, summary.Files.Unchanged)
 	b.P("Dirs:        %5d new, %5d changed, %5d unmodified\n", summary.Dirs.New, summary.Dirs.Changed, summary.Dirs.Unchanged)
@@ -178,11 +140,21 @@ func (b *TextProgress) Finish(snapshotID restic.ID, start time.Time, summary *Su
 	if dryRun {
 		verb = "Would add"
 	}
-	b.P("%s to the repo: %-5s\n", verb, formatBytes(summary.ItemStats.DataSize+summary.ItemStats.TreeSize))
+	b.P("%s to the repository: %-5s (%-5s stored)\n", verb,
+		ui.FormatBytes(summary.ItemStats.DataSize+summary.ItemStats.TreeSize),
+		ui.FormatBytes(summary.ItemStats.DataSizeInRepo+summary.ItemStats.TreeSizeInRepo))
 	b.P("\n")
 	b.P("processed %v files, %v in %s",
 		summary.Files.New+summary.Files.Changed+summary.Files.Unchanged,
-		formatBytes(summary.ProcessedBytes),
-		formatDuration(time.Since(start)),
+		ui.FormatBytes(summary.ProcessedBytes),
+		ui.FormatDuration(summary.BackupEnd.Sub(summary.BackupStart)),
 	)
+
+	if !dryRun {
+		if id.IsNull() {
+			b.P("skipped creating snapshot\n")
+		} else {
+			b.P("snapshot %s saved\n", id.Str())
+		}
+	}
 }
