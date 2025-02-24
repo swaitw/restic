@@ -5,16 +5,21 @@ import (
 	"fmt"
 
 	"github.com/restic/restic/internal/debug"
+	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/restic"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
-var cmdCopy = &cobra.Command{
-	Use:   "copy [flags] [snapshotID ...]",
-	Short: "Copy snapshots from one repository to another",
-	Long: `
+func newCopyCommand() *cobra.Command {
+	var opts CopyOptions
+	cmd := &cobra.Command{
+		Use:   "copy [flags] [snapshotID ...]",
+		Short: "Copy snapshots from one repository to another",
+		Long: `
 The "copy" command copies one or more snapshots from one repository to another.
 
 NOTE: This process will have to both download (read) and upload (write) the
@@ -28,100 +33,109 @@ This means that copied files, which existed in both the source and destination
 repository, /may occupy up to twice their space/ in the destination repository.
 This can be mitigated by the "--copy-chunker-params" option when initializing a
 new destination repository using the "init" command.
+
+EXIT STATUS
+===========
+
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 `,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runCopy(copyOptions, globalOptions, args)
-	},
+		GroupID:           cmdGroupDefault,
+		DisableAutoGenTag: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runCopy(cmd.Context(), opts, globalOptions, args)
+		},
+	}
+
+	opts.AddFlags(cmd.Flags())
+	return cmd
 }
 
 // CopyOptions bundles all options for the copy command.
 type CopyOptions struct {
 	secondaryRepoOptions
-	Hosts []string
-	Tags  restic.TagLists
-	Paths []string
+	restic.SnapshotFilter
 }
 
-var copyOptions CopyOptions
-
-func init() {
-	cmdRoot.AddCommand(cmdCopy)
-
-	f := cmdCopy.Flags()
-	initSecondaryRepoOptions(f, &copyOptions.secondaryRepoOptions, "destination", "to copy snapshots to")
-	f.StringArrayVarP(&copyOptions.Hosts, "host", "H", nil, "only consider snapshots for this `host`, when no snapshot ID is given (can be specified multiple times)")
-	f.Var(&copyOptions.Tags, "tag", "only consider snapshots which include this `taglist`, when no snapshot ID is given")
-	f.StringArrayVar(&copyOptions.Paths, "path", nil, "only consider snapshots which include this (absolute) `path`, when no snapshot ID is given")
+func (opts *CopyOptions) AddFlags(f *pflag.FlagSet) {
+	opts.secondaryRepoOptions.AddFlags(f, "destination", "to copy snapshots from")
+	initMultiSnapshotFilter(f, &opts.SnapshotFilter, true)
 }
 
-func runCopy(opts CopyOptions, gopts GlobalOptions, args []string) error {
-	dstGopts, err := fillSecondaryGlobalOpts(opts.secondaryRepoOptions, gopts, "destination")
+func runCopy(ctx context.Context, opts CopyOptions, gopts GlobalOptions, args []string) error {
+	secondaryGopts, isFromRepo, err := fillSecondaryGlobalOpts(ctx, opts.secondaryRepoOptions, gopts, "destination")
+	if err != nil {
+		return err
+	}
+	if isFromRepo {
+		// swap global options, if the secondary repo was set via from-repo
+		gopts, secondaryGopts = secondaryGopts, gopts
+	}
+
+	ctx, srcRepo, unlock, err := openWithReadLock(ctx, gopts, gopts.NoLock)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	ctx, dstRepo, unlock, err := openWithAppendLock(ctx, secondaryGopts, false)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	srcSnapshotLister, err := restic.MemorizeList(ctx, srcRepo, restic.SnapshotFile)
 	if err != nil {
 		return err
 	}
 
-	ctx, cancel := context.WithCancel(gopts.ctx)
-	defer cancel()
-
-	srcRepo, err := OpenRepository(gopts)
-	if err != nil {
-		return err
-	}
-
-	dstRepo, err := OpenRepository(dstGopts)
-	if err != nil {
-		return err
-	}
-
-	if !gopts.NoLock {
-		srcLock, err := lockRepo(ctx, srcRepo)
-		defer unlockRepo(srcLock)
-		if err != nil {
-			return err
-		}
-	}
-
-	dstLock, err := lockRepo(ctx, dstRepo)
-	defer unlockRepo(dstLock)
+	dstSnapshotLister, err := restic.MemorizeList(ctx, dstRepo, restic.SnapshotFile)
 	if err != nil {
 		return err
 	}
 
 	debug.Log("Loading source index")
-	if err := srcRepo.LoadIndex(ctx); err != nil {
+	bar := newIndexProgress(gopts.Quiet, gopts.JSON)
+	if err := srcRepo.LoadIndex(ctx, bar); err != nil {
 		return err
 	}
-
+	bar = newIndexProgress(gopts.Quiet, gopts.JSON)
 	debug.Log("Loading destination index")
-	if err := dstRepo.LoadIndex(ctx); err != nil {
+	if err := dstRepo.LoadIndex(ctx, bar); err != nil {
 		return err
 	}
 
 	dstSnapshotByOriginal := make(map[restic.ID][]*restic.Snapshot)
-	for sn := range FindFilteredSnapshots(ctx, dstRepo, opts.Hosts, opts.Tags, opts.Paths, nil) {
+	for sn := range FindFilteredSnapshots(ctx, dstSnapshotLister, dstRepo, &opts.SnapshotFilter, nil) {
 		if sn.Original != nil && !sn.Original.IsNull() {
 			dstSnapshotByOriginal[*sn.Original] = append(dstSnapshotByOriginal[*sn.Original], sn)
 		}
 		// also consider identical snapshot copies
 		dstSnapshotByOriginal[*sn.ID()] = append(dstSnapshotByOriginal[*sn.ID()], sn)
 	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	// remember already processed trees across all snapshots
 	visitedTrees := restic.NewIDSet()
 
-	for sn := range FindFilteredSnapshots(ctx, srcRepo, opts.Hosts, opts.Tags, opts.Paths, args) {
-		Verbosef("\nsnapshot %s of %v at %s)\n", sn.ID().Str(), sn.Paths, sn.Time)
-
+	for sn := range FindFilteredSnapshots(ctx, srcSnapshotLister, srcRepo, &opts.SnapshotFilter, args) {
 		// check whether the destination has a snapshot with the same persistent ID which has similar snapshot fields
 		srcOriginal := *sn.ID()
 		if sn.Original != nil {
 			srcOriginal = *sn.Original
 		}
+
 		if originalSns, ok := dstSnapshotByOriginal[srcOriginal]; ok {
 			isCopy := false
 			for _, originalSn := range originalSns {
 				if similarSnapshots(originalSn, sn) {
-					Verbosef("skipping source snapshot %s, was already copied to snapshot %s\n", sn.ID().Str(), originalSn.ID().Str())
+					Verboseff("\n%v\n", sn)
+					Verboseff("skipping source snapshot %s, was already copied to snapshot %s\n", sn.ID().Str(), originalSn.ID().Str())
 					isCopy = true
 					break
 				}
@@ -130,17 +144,12 @@ func runCopy(opts CopyOptions, gopts GlobalOptions, args []string) error {
 				continue
 			}
 		}
+		Verbosef("\n%v\n", sn)
 		Verbosef("  copy started, this may take a while...\n")
-
-		if err := copyTree(ctx, srcRepo, dstRepo, visitedTrees, *sn.Tree); err != nil {
+		if err := copyTree(ctx, srcRepo, dstRepo, visitedTrees, *sn.Tree, gopts.Quiet); err != nil {
 			return err
 		}
 		debug.Log("tree copied")
-
-		if err = dstRepo.Flush(ctx); err != nil {
-			return err
-		}
-		debug.Log("flushed packs and saved index")
 
 		// save snapshot
 		sn.Parent = nil // Parent does not have relevance in the new repo.
@@ -148,13 +157,13 @@ func runCopy(opts CopyOptions, gopts GlobalOptions, args []string) error {
 		if sn.Original == nil {
 			sn.Original = sn.ID()
 		}
-		newID, err := dstRepo.SaveJSONUnpacked(ctx, restic.SnapshotFile, sn)
+		newID, err := restic.SaveSnapshot(ctx, dstRepo, sn)
 		if err != nil {
 			return err
 		}
 		Verbosef("snapshot %s saved\n", newID.Str())
 	}
-	return nil
+	return ctx.Err()
 }
 
 func similarSnapshots(sna *restic.Snapshot, snb *restic.Snapshot) bool {
@@ -176,82 +185,72 @@ func similarSnapshots(sna *restic.Snapshot, snb *restic.Snapshot) bool {
 	return true
 }
 
-const numCopyWorkers = 8
-
 func copyTree(ctx context.Context, srcRepo restic.Repository, dstRepo restic.Repository,
-	visitedTrees restic.IDSet, rootTreeID restic.ID) error {
+	visitedTrees restic.IDSet, rootTreeID restic.ID, quiet bool) error {
 
-	idChan := make(chan restic.ID)
-	wg, ctx := errgroup.WithContext(ctx)
+	wg, wgCtx := errgroup.WithContext(ctx)
 
-	treeStream := restic.StreamTrees(ctx, wg, srcRepo, restic.IDs{rootTreeID}, func(treeID restic.ID) bool {
+	treeStream := restic.StreamTrees(wgCtx, wg, srcRepo, restic.IDs{rootTreeID}, func(treeID restic.ID) bool {
 		visited := visitedTrees.Has(treeID)
 		visitedTrees.Insert(treeID)
 		return visited
 	}, nil)
 
+	copyBlobs := restic.NewBlobSet()
+	packList := restic.NewIDSet()
+
+	enqueue := func(h restic.BlobHandle) {
+		pb := srcRepo.LookupBlob(h.Type, h.ID)
+		copyBlobs.Insert(h)
+		for _, p := range pb {
+			packList.Insert(p.PackID)
+		}
+	}
+
 	wg.Go(func() error {
-		defer close(idChan)
-		// reused buffer
-		var buf []byte
 		for tree := range treeStream {
 			if tree.Error != nil {
 				return fmt.Errorf("LoadTree(%v) returned error %v", tree.ID.Str(), tree.Error)
 			}
 
 			// Do we already have this tree blob?
-			if !dstRepo.Index().Has(restic.BlobHandle{ID: tree.ID, Type: restic.TreeBlob}) {
+			treeHandle := restic.BlobHandle{ID: tree.ID, Type: restic.TreeBlob}
+			if _, ok := dstRepo.LookupBlobSize(treeHandle.Type, treeHandle.ID); !ok {
 				// copy raw tree bytes to avoid problems if the serialization changes
-				var err error
-				buf, err = srcRepo.LoadBlob(ctx, restic.TreeBlob, tree.ID, buf)
-				if err != nil {
-					return fmt.Errorf("LoadBlob(%v) for tree returned error %v", tree.ID, err)
-				}
-
-				_, _, err = dstRepo.SaveBlob(ctx, restic.TreeBlob, buf, tree.ID, false)
-				if err != nil {
-					return fmt.Errorf("SaveBlob(%v) for tree returned error %v", tree.ID.Str(), err)
-				}
+				enqueue(treeHandle)
 			}
 
 			for _, entry := range tree.Nodes {
 				// Recursion into directories is handled by StreamTrees
 				// Copy the blobs for this file.
 				for _, blobID := range entry.Content {
-					select {
-					case idChan <- blobID:
-					case <-ctx.Done():
-						return ctx.Err()
+					h := restic.BlobHandle{Type: restic.DataBlob, ID: blobID}
+					if _, ok := dstRepo.LookupBlobSize(h.Type, h.ID); !ok {
+						enqueue(h)
 					}
 				}
 			}
 		}
 		return nil
 	})
-
-	for i := 0; i < numCopyWorkers; i++ {
-		wg.Go(func() error {
-			// reused buffer
-			var buf []byte
-			for blobID := range idChan {
-				// Do we already have this data blob?
-				if dstRepo.Index().Has(restic.BlobHandle{ID: blobID, Type: restic.DataBlob}) {
-					continue
-				}
-				debug.Log("Copying blob %s\n", blobID.Str())
-				var err error
-				buf, err = srcRepo.LoadBlob(ctx, restic.DataBlob, blobID, buf)
-				if err != nil {
-					return fmt.Errorf("LoadBlob(%v) returned error %v", blobID, err)
-				}
-
-				_, _, err = dstRepo.SaveBlob(ctx, restic.DataBlob, buf, blobID, false)
-				if err != nil {
-					return fmt.Errorf("SaveBlob(%v) returned error %v", blobID, err)
-				}
-			}
-			return nil
-		})
+	err := wg.Wait()
+	if err != nil {
+		return err
 	}
-	return wg.Wait()
+
+	bar := newProgressMax(!quiet, uint64(len(packList)), "packs copied")
+	_, err = repository.Repack(
+		ctx,
+		srcRepo,
+		dstRepo,
+		packList,
+		copyBlobs,
+		bar,
+		func(msg string, args ...interface{}) { fmt.Printf(msg+"\n", args...) },
+	)
+	bar.Done()
+	if err != nil {
+		return errors.Fatal(err.Error())
+	}
+	return nil
 }

@@ -1,38 +1,42 @@
 package main
 
 import (
-	"bytes"
-	"io/ioutil"
+	"context"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/restic/restic/internal/test"
+	"github.com/restic/restic/internal/errors"
 	rtest "github.com/restic/restic/internal/test"
 )
 
 func Test_PrintFunctionsRespectsGlobalStdout(t *testing.T) {
-	gopts := globalOptions
-	defer func() {
-		globalOptions = gopts
-	}()
-
-	buf := bytes.NewBuffer(nil)
-	globalOptions.stdout = buf
-
 	for _, p := range []func(){
 		func() { Println("message") },
 		func() { Print("message\n") },
 		func() { Printf("mes%s\n", "sage") },
 	} {
-		p()
+		buf, _ := withCaptureStdout(func() error {
+			p()
+			return nil
+		})
 		rtest.Equals(t, "message\n", buf.String())
-		buf.Reset()
 	}
 }
 
+type errorReader struct{ err error }
+
+func (r *errorReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestReadPassword(t *testing.T) {
+	want := errors.New("foo")
+	_, err := readPassword(&errorReader{want})
+	rtest.Assert(t, errors.Is(err, want), "wrong error %v", err)
+}
+
 func TestReadRepo(t *testing.T) {
-	tempDir, cleanup := test.TempDir(t)
-	defer cleanup()
+	tempDir := rtest.TempDir(t)
 
 	// test --repo option
 	var opts GlobalOptions
@@ -43,7 +47,7 @@ func TestReadRepo(t *testing.T) {
 
 	// test --repository-file option
 	foo := filepath.Join(tempDir, "foo")
-	err = ioutil.WriteFile(foo, []byte(tempDir+"\n"), 0666)
+	err = os.WriteFile(foo, []byte(tempDir+"\n"), 0666)
 	rtest.OK(t, err)
 
 	var opts2 GlobalOptions
@@ -58,4 +62,15 @@ func TestReadRepo(t *testing.T) {
 	if err == nil {
 		t.Fatal("must not read repository path from invalid file path")
 	}
+}
+
+func TestReadEmptyPassword(t *testing.T) {
+	opts := GlobalOptions{InsecureNoPassword: true}
+	password, err := ReadPassword(context.TODO(), opts, "test")
+	rtest.OK(t, err)
+	rtest.Equals(t, "", password, "got unexpected password")
+
+	opts.password = "invalid"
+	_, err = ReadPassword(context.TODO(), opts, "test")
+	rtest.Assert(t, strings.Contains(err.Error(), "must not be specified together with providing a password via a cli option or environment variable"), "unexpected error message, got %v", err)
 }

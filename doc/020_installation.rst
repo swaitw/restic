@@ -40,7 +40,7 @@ package from the official community repos, e.g. using ``apk``:
 Arch Linux
 ==========
 
-On `Arch Linux <https://www.archlinux.org/>`__, there is a package called ``restic``
+On `Arch Linux <https://archlinux.org/>`__, there is a package called ``restic``
 installed from the official community repos, e.g. with ``pacman -S``:
 
 .. code-block:: console
@@ -77,12 +77,17 @@ avoid any conflicts:
 macOS
 =====
 
-If you are using macOS, you can install restic using the
-`homebrew <https://brew.sh/>`__ package manager:
+If you are using macOS, you can install restic using `Homebrew <https://brew.sh/>`__:
 
 .. code-block:: console
 
     $ brew install restic
+
+On Linux and macOS, you can also install it using `pkgx <https://pkgx.sh/>`__:
+
+.. code-block:: console
+
+    $ pkgx install restic
 
 You may also install it using `MacPorts <https://www.macports.org/>`__:
 
@@ -93,7 +98,7 @@ You may also install it using `MacPorts <https://www.macports.org/>`__:
 Nix & NixOS
 ===========
 
-If you are using `Nix <https://nixos.org/nix/>`__ or `NixOS <https://nixos.org/>`__
+If you are using `Nix / NixOS <https://nixos.org>`__
 there is a package available named ``restic``.
 It can be installed using ``nix-env``:
 
@@ -265,18 +270,23 @@ binary, you can get it with `docker pull` like this:
 
     $ docker pull restic/restic
 
-.. note::
-   | Another docker container which offers more configuration options is
-   | available as a contribution (Thank you!). You can find it at
-   | https://github.com/Lobaro/restic-backup-docker
+The container is also available on the GitHub Container Registry:
+
+.. code-block:: console
+
+    $ docker pull ghcr.io/restic/restic
+
+Restic relies on the hostname for various operations. Make sure to set a static
+hostname using `--hostname` when creating a Docker container, otherwise Docker
+will assign a random hostname each time.
 
 From Source
 ***********
 
 restic is written in the Go programming language and you need at least
-Go version 1.14. Building restic may also work with older versions of Go,
+Go version 1.22. Building restic may also work with older versions of Go,
 but that's not supported. See the `Getting
-started <https://golang.org/doc/install>`__ guide of the Go project for
+started <https://go.dev/doc/install>`__ guide of the Go project for
 instructions how to install Go.
 
 In order to build restic from source, execute the following steps:
@@ -313,14 +323,14 @@ compiler. Building restic with gccgo may work, but is not supported.
 Autocompletion
 **************
 
-Restic can write out man pages and bash/fish/zsh compatible autocompletion scripts:
+Restic can write out man pages and bash/fish/zsh/powershell compatible autocompletion scripts:
 
 .. code-block:: console
 
     $ ./restic generate --help
 
     The "generate" command writes automatically generated files (like the man pages
-    and the auto-completion files for bash, fish and zsh).
+    and the auto-completion files for bash, fish, zsh and powershell).
 
     Usage:
       restic generate [flags] [command]
@@ -330,6 +340,7 @@ Restic can write out man pages and bash/fish/zsh compatible autocompletion scrip
           --fish-completion file   write fish completion file
       -h, --help                   help for generate
           --man directory          write man pages to directory
+          --powershell-completion  write powershell completion file
           --zsh-completion file    write zsh completion file
 
 Example for using sudo to write a bash completion script directly to the system-wide location:
@@ -339,7 +350,29 @@ Example for using sudo to write a bash completion script directly to the system-
     $ sudo ./restic generate --bash-completion /etc/bash_completion.d/restic
     writing bash completion file to /etc/bash_completion.d/restic
 
+Example for using sudo to write a zsh completion script directly to the system-wide location:
+
+.. code-block:: console
+
+    $ sudo ./restic generate --zsh-completion /usr/local/share/zsh/site-functions/_restic
+    writing zsh completion file to /usr/local/share/zsh/site-functions/_restic
+
 .. note:: The path for the ``--bash-completion`` option may vary depending on
    the operating system used, e.g. ``/usr/share/bash-completion/completions/restic``
    in Debian and derivatives. Please look up the correct path in the appropriate
    documentation.
+
+Example for setting up a powershell completion script for the local user's profile:
+
+.. code-block:: pwsh-session
+
+    # Create profile if one does not exist
+    PS> If (!(Test-Path $PROFILE.CurrentUserAllHosts)) {New-Item -Path $PROFILE.CurrentUserAllHosts -Force}
+
+    PS> $ProfileDir = (Get-Item $PROFILE.CurrentUserAllHosts).Directory
+
+    # Generate Restic completions in the same directory as the profile
+    PS> restic generate --powershell-completion "$ProfileDir\restic-completion.ps1"
+
+    # Append to the profile file the command to load Restic completions
+    PS> Add-Content -Path $PROFILE.CurrentUserAllHosts -Value "`r`nImport-Module $ProfileDir\restic-completion.ps1"

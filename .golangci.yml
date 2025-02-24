@@ -10,13 +10,10 @@ linters:
     # make sure all errors returned by functions are handled
     - errcheck
 
-    # find unused code
-    - deadcode
-
     # show how code can be simplified
     - gosimple
 
-    # # make sure code is formatted
+    # make sure code is formatted
     - gofmt
 
     # examine code and report suspicious constructs, such as Printf calls whose
@@ -24,7 +21,7 @@ linters:
     - govet
 
     # make sure names and comments are used according to the conventions
-    - golint
+    - revive
 
     # detect when assignments to existing variables are not used
     - ineffassign
@@ -35,14 +32,13 @@ linters:
     # find unused variables, functions, structs, types, etc.
     - unused
 
-    # find unused struct fields
-    - structcheck
-
-    # find unused global variables
-    - varcheck
-
     # parse and typecheck code
     - typecheck
+
+    # ensure that http response bodies are closed
+    - bodyclose
+
+    - importas
 
 issues:
   # don't use the default exclude rules, this hides (among others) ignored
@@ -51,7 +47,24 @@ issues:
 
   # list of things to not warn about
   exclude:
-    # golint: do not warn about missing comments for exported stuff
-    - exported (function|method|var|type|const) `.*` should have comment or be unexported
-    # golint: ignore constants in all caps
+    # revive: do not warn about missing comments for exported stuff
+    - exported (function|method|var|type|const) .* should have comment or be unexported
+    # revive: ignore constants in all caps
     - don't use ALL_CAPS in Go names; use CamelCase
+    # revive: lots of packages don't have such a comment
+    - "package-comments: should have a package comment"
+    # staticcheck: there's no easy way to replace these packages
+    - "SA1019: \"golang.org/x/crypto/poly1305\" is deprecated"
+    - "SA1019: \"golang.org/x/crypto/openpgp\" is deprecated"
+    - "redefines-builtin-id:"
+
+  exclude-rules:
+    # revive: ignore unused parameters in tests
+    - path: (_test\.go|testing\.go|backend/.*/tests\.go)
+      text: "unused-parameter:"
+
+linters-settings:
+  importas:
+    alias:
+      - pkg: github.com/restic/restic/internal/test
+        alias: rtest

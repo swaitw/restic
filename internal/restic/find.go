@@ -8,14 +8,21 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// TreeLoader loads a tree from a repository.
-type TreeLoader interface {
-	LoadTree(context.Context, ID) (*Tree, error)
+// Loader loads a blob from a repository.
+type Loader interface {
+	LoadBlob(context.Context, BlobType, ID, []byte) ([]byte, error)
+	LookupBlobSize(tpe BlobType, id ID) (uint, bool)
+	Connections() uint
+}
+
+type FindBlobSet interface {
+	Has(bh BlobHandle) bool
+	Insert(bh BlobHandle)
 }
 
 // FindUsedBlobs traverses the tree ID and adds all seen blobs (trees and data
 // blobs) to the set blobs. Already seen tree blobs will not be visited again.
-func FindUsedBlobs(ctx context.Context, repo TreeLoader, treeIDs IDs, blobs BlobSet, p *progress.Counter) error {
+func FindUsedBlobs(ctx context.Context, repo Loader, treeIDs IDs, blobs FindBlobSet, p *progress.Counter) error {
 	var lock sync.Mutex
 
 	wg, ctx := errgroup.WithContext(ctx)
@@ -39,7 +46,7 @@ func FindUsedBlobs(ctx context.Context, repo TreeLoader, treeIDs IDs, blobs Blob
 			lock.Lock()
 			for _, node := range tree.Nodes {
 				switch node.Type {
-				case "file":
+				case NodeTypeFile:
 					for _, blob := range node.Content {
 						blobs.Insert(BlobHandle{ID: blob, Type: DataBlob})
 					}

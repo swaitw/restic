@@ -51,7 +51,7 @@ looks like this:
     [0:00] 100.00%  16 / 16 snapshots
     no errors were found
 
-The message means that there is more data stored in the repo than
+The message means that there is more data stored in the repository than
 strictly necessary. This is uncritical. With high probability this is duplicate data
 caused by an interrupted backup run or upload operation. In
 order to clean it up, the command ``restic prune`` can be used.
@@ -90,7 +90,7 @@ The error here is that the tilde ``~`` in ``"~/documents"`` didn't get expanded 
     /home/john/documents
 
     $ echo "~/documents"
-    ~/document
+    ~/documents
 
     $ echo "$HOME/documents"
     /home/john/documents
@@ -100,7 +100,7 @@ Restic handles globbing and expansion in the following ways:
 -  Globbing is only expanded for lines read via ``--files-from``
 -  Environment variables are not expanded in the file read via ``--files-from``
 -  ``*`` is expanded for paths read via ``--files-from``
--  e.g. For backup targets given to restic as arguments on the shell, neither glob expansion nor shell variable replacement is done. If restic is called as ``restic backup '*' '$HOME'``, it will try to backup the literal file(s)/dir(s) ``*`` and ``$HOME``
+-  e.g. For backup sources given to restic as arguments on the shell, neither glob expansion nor shell variable replacement is done. If restic is called as ``restic backup '*' '$HOME'``, it will try to backup the literal file(s)/dir(s) ``*`` and ``$HOME``
 -  Double-asterisk ``**`` only works in exclude patterns as this is a custom extension built into restic; the shell must not expand it
 
 
@@ -168,8 +168,8 @@ scheduling algorithm to give it the least favorable niceness (19).
 The above example makes sure that the system the backup runs on
 is not slowed down, which is particularly useful for servers.
 
-Creating new repo on a Synology NAS via sftp fails
---------------------------------------------------
+Creating new repository on a Synology NAS via sftp fails
+--------------------------------------------------------
 
 For using restic with a Synology NAS via sftp, please make sure that the
 specified path is absolute, it must start with a slash (``/``).
@@ -179,7 +179,7 @@ with an error similar to the following:
 
 ::
 
-    $ restic init -r sftp:user@nas:/volume1/restic-repo init
+    $ restic -r sftp:user@nas:/volume1/restic-repo init
     create backend at sftp:user@nas:/volume1/restic-repo/ failed:
         mkdirAll(/volume1/restic-repo/index): unable to create directories: [...]
 
@@ -199,7 +199,7 @@ The following may work:
 
 ::
 
-    $ restic init -r sftp:user@nas:/restic-repo init
+    $ restic -r sftp:user@nas:/restic-repo init
 
 Why does restic perform so poorly on Windows?
 ---------------------------------------------
@@ -228,3 +228,47 @@ Restic backup command fails to find a valid file in Windows
 
 If the name of a file in Windows contains an invalid character, Restic will not be
 able to read the file. To solve this issue, consider renaming the particular file.
+
+What can I do in case of "request timeout" errors?
+--------------------------------------------------
+
+Restic monitors connections to the backend to detect stuck requests. If a request
+does not return any data within five minutes, restic assumes the request is stuck and
+retries it. However, for large repositories it sometimes takes longer than that to
+collect a list of all files, causing the following error:
+
+::
+
+    List(data) returned error, retrying after 1s: [...]: request timeout
+
+In this case you can increase the timeout using the ``--stuck-request-timeout`` option.
+
+Are "cold storages" supported?
+------------------------------
+
+Generally, restic does not natively support "cold storage" solutions. However,
+experimental support for restoring from **S3 Glacier** and **S3 Glacier Deep
+Archive** storage classes is available:
+
+.. code-block:: console
+
+   $ restic backup -o s3.storage-class=GLACIER somedir/
+   $ RESTIC_FEATURES=s3-restore restic restore -o s3.enable-restore=1 -o s3.restore-days=7 -o s3.restore-timeout=1d latest
+
+**Notes:**
+
+- This feature is still in early alpha stage. Expect arbitrary breaking changes
+  in the future (although we'll do our best-effort to avoid them).
+- Expect restores to hang from 1 up to 42 hours depending on your storage
+  class, provider and luck. Restores from cold storages are known to be
+  time-consuming. You may need to adjust the `s3.restore-timeout` if a restore
+  operation takes more than 24 hours.
+- Restic will prevent sending metadata files (such as config files, lock files
+  or tree blobs) to Glacier or Deep Archive. Standard class is used instead to
+  ensure normal and fast operations for most tasks.
+- Currently, only the following commands are known to work:
+
+  - `backup`
+  - `copy`
+  - `prune`
+  - `restore`

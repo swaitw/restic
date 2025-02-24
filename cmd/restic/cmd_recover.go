@@ -8,12 +8,14 @@ import (
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/restic"
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 )
 
-var cmdRecover = &cobra.Command{
-	Use:   "recover [flags]",
-	Short: "Recover data from the repository not referenced by snapshots",
-	Long: `
+func newRecoverCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "recover [flags]",
+		Short: "Recover data from the repository not referenced by snapshots",
+		Long: `
 The "recover" command builds a new snapshot from all directories it can find in
 the raw data of the repository which are not referenced in an existing snapshot.
 It can be used if, for example, a snapshot has been removed by accident with "forget".
@@ -21,37 +23,41 @@ It can be used if, for example, a snapshot has been removed by accident with "fo
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 `,
-	DisableAutoGenTag: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runRecover(globalOptions)
-	},
+		GroupID:           cmdGroupDefault,
+		DisableAutoGenTag: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runRecover(cmd.Context(), globalOptions)
+		},
+	}
+	return cmd
 }
 
-func init() {
-	cmdRoot.AddCommand(cmdRecover)
-}
-
-func runRecover(gopts GlobalOptions) error {
+func runRecover(ctx context.Context, gopts GlobalOptions) error {
 	hostname, err := os.Hostname()
 	if err != nil {
 		return err
 	}
 
-	repo, err := OpenRepository(gopts)
+	ctx, repo, unlock, err := openWithAppendLock(ctx, gopts, false)
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
-	lock, err := lockRepo(gopts.ctx, repo)
-	defer unlockRepo(lock)
+	snapshotLister, err := restic.MemorizeList(ctx, repo, restic.SnapshotFile)
 	if err != nil {
 		return err
 	}
 
 	Verbosef("load index files\n")
-	if err = repo.LoadIndex(gopts.ctx); err != nil {
+	bar := newIndexProgress(gopts.Quiet, gopts.JSON)
+	if err = repo.LoadIndex(ctx, bar); err != nil {
 		return err
 	}
 
@@ -59,23 +65,29 @@ func runRecover(gopts GlobalOptions) error {
 	// tree. If it is not referenced, we have a root tree.
 	trees := make(map[restic.ID]bool)
 
-	for blob := range repo.Index().Each(gopts.ctx) {
+	err = repo.ListBlobs(ctx, func(blob restic.PackedBlob) {
 		if blob.Type == restic.TreeBlob {
 			trees[blob.Blob.ID] = false
 		}
+	})
+	if err != nil {
+		return err
 	}
 
 	Verbosef("load %d trees\n", len(trees))
-	bar := newProgressMax(!gopts.Quiet, uint64(len(trees)), "trees loaded")
+	bar = newProgressMax(!gopts.Quiet, uint64(len(trees)), "trees loaded")
 	for id := range trees {
-		tree, err := repo.LoadTree(gopts.ctx, id)
+		tree, err := restic.LoadTree(ctx, repo, id)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err != nil {
 			Warnf("unable to load tree %v: %v\n", id.Str(), err)
 			continue
 		}
 
 		for _, node := range tree.Nodes {
-			if node.Type == "dir" && node.Subtree != nil {
+			if node.Type == restic.NodeTypeDir && node.Subtree != nil {
 				trees[*node.Subtree] = true
 			}
 		}
@@ -84,7 +96,7 @@ func runRecover(gopts GlobalOptions) error {
 	bar.Done()
 
 	Verbosef("load snapshots\n")
-	err = restic.ForAllSnapshots(gopts.ctx, repo, nil, func(id restic.ID, sn *restic.Snapshot, err error) error {
+	err = restic.ForAllSnapshots(ctx, snapshotLister, repo, nil, func(_ restic.ID, sn *restic.Snapshot, _ error) error {
 		trees[*sn.Tree] = true
 		return nil
 	})
@@ -107,11 +119,15 @@ func runRecover(gopts GlobalOptions) error {
 		return nil
 	}
 
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	tree := restic.NewTree(len(roots))
 	for id := range roots {
 		var subtreeID = id
 		node := restic.Node{
-			Type:       "dir",
+			Type:       restic.NodeTypeDir,
 			Name:       id.Str(),
 			Mode:       0755,
 			Subtree:    &subtreeID,
@@ -125,21 +141,33 @@ func runRecover(gopts GlobalOptions) error {
 		}
 	}
 
-	treeID, err := repo.SaveTree(gopts.ctx, tree)
+	wg, wgCtx := errgroup.WithContext(ctx)
+	repo.StartPackUploader(wgCtx, wg)
+
+	var treeID restic.ID
+	wg.Go(func() error {
+		var err error
+		treeID, err = restic.SaveTree(wgCtx, repo, tree)
+		if err != nil {
+			return errors.Fatalf("unable to save new tree to the repository: %v", err)
+		}
+
+		err = repo.Flush(wgCtx)
+		if err != nil {
+			return errors.Fatalf("unable to save blobs to the repository: %v", err)
+		}
+		return nil
+	})
+	err = wg.Wait()
 	if err != nil {
-		return errors.Fatalf("unable to save new tree to the repo: %v", err)
+		return err
 	}
 
-	err = repo.Flush(gopts.ctx)
-	if err != nil {
-		return errors.Fatalf("unable to save blobs to the repo: %v", err)
-	}
-
-	return createSnapshot(gopts.ctx, "/recover", hostname, []string{"recovered"}, repo, &treeID)
+	return createSnapshot(ctx, "/recover", hostname, []string{"recovered"}, repo, &treeID)
 
 }
 
-func createSnapshot(ctx context.Context, name, hostname string, tags []string, repo restic.Repository, tree *restic.ID) error {
+func createSnapshot(ctx context.Context, name, hostname string, tags []string, repo restic.SaverUnpacked[restic.WriteableFileType], tree *restic.ID) error {
 	sn, err := restic.NewSnapshot([]string{name}, tags, hostname, time.Now())
 	if err != nil {
 		return errors.Fatalf("unable to save snapshot: %v", err)
@@ -147,7 +175,7 @@ func createSnapshot(ctx context.Context, name, hostname string, tags []string, r
 
 	sn.Tree = tree
 
-	id, err := repo.SaveJSONUnpacked(ctx, restic.SnapshotFile, sn)
+	id, err := restic.SaveSnapshot(ctx, repo, sn)
 	if err != nil {
 		return errors.Fatalf("unable to save snapshot: %v", err)
 	}
